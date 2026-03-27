@@ -114,7 +114,6 @@ FAKE_EMPLOYEES = [
 
 ATTACKER_IPS = ["45.33.32.156","198.51.100.42","203.0.113.77","185.220.101.33","91.108.4.18"]
 
-# ─── FIX 1: /tmp is always writable on Railway ────────────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/tmp/nullgrids.db")
 
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
@@ -122,6 +121,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     c = conn.cursor()
+
     c.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,6 +225,7 @@ def init_db():
     );
     """)
 
+    # Seed users
     def pw(p): return hashlib.sha256(p.encode()).hexdigest()
     users = [
         ("admin","admin123","admin","admin@meridiantech.com","IT","192.168.1.1"),
@@ -239,6 +240,7 @@ def init_db():
                       (u[0], pw(u[1]), u[2], u[3], u[4], u[5]))
         except: pass
 
+    # Seed employees
     for emp in FAKE_EMPLOYEES:
         try:
             c.execute("INSERT INTO employees(username,email,department,ip,salary,ssn,notes) VALUES(?,?,?,?,?,?,?)",
@@ -248,6 +250,7 @@ def init_db():
                        "Standard employee record"))
         except: pass
 
+    # Seed financials
     accounts = [
         ("ACC-001-EXEC",4200000,"Executive Reserve Fund","CONFIDENTIAL"),
         ("ACC-002-OPS",890000,"Operations Budget","INTERNAL"),
@@ -260,43 +263,46 @@ def init_db():
             c.execute("INSERT INTO financials(account,amount,description,classification) VALUES(?,?,?,?)", acc)
         except: pass
 
+    # Seed breach state
     c.execute("INSERT OR IGNORE INTO breach_state(id,breach_pct,current_stage,chain_id) VALUES(1,0,0,?)",
               (str(uuid.uuid4())[:8],))
+
     conn.commit()
     conn.close()
-    print(f"[✓] Database initialized at {DB_PATH}")
+    print("[✓] Database initialized")
 
-# ─── FIX 2: Flask app AFTER init_db is defined ───────────────────────────────
+
+# ─── FLASK APP ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
 
-# ─── FIX 3: _ensure_tables — thread-safe, called before every DB op ──────────
-_log_lock  = threading.Lock()
-_init_lock = threading.Lock()
-_db_ready  = False
-
-def _ensure_tables():
-    global _db_ready
-    if _db_ready:
-        return
-    with _init_lock:
-        if _db_ready:
-            return
-        try:
-            _c = sqlite3.connect(DB_PATH, timeout=5)
-            _c.execute("SELECT 1 FROM users LIMIT 1")
-            _c.close()
-            _db_ready = True
-        except sqlite3.OperationalError:
-            print(f"[!] _ensure_tables: tables missing — calling init_db()")
-            init_db()
-            _db_ready = True
-
-# ─── FIX 4: Init at module load so Gunicorn picks it up ──────────────────────
+# 🔥 RAILWAY FIX: init DB at module load time so Gunicorn picks it up
 print(f"[*] DB_PATH = {DB_PATH}")
-_ensure_tables()
+print("[*] Auto-initializing database...")
+try:
+    init_db()
+    print(f"[✓] init_db() SUCCESS — {DB_PATH}")
+except Exception as _e:
+    print(f"[✗] init_db() FAILED at module level: {_e}")
 
-# ─── DB CONNECTION PER REQUEST ────────────────────────────────────────────────
+
+# ─── DB HEALTH CHECK ──────────────────────────────────────────────────────────
+@app.before_request
+def ensure_db_ready():
+    """Self-healing: re-run init_db if tables are missing for any reason."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        conn.execute("SELECT 1 FROM users LIMIT 1")
+        conn.close()
+    except sqlite3.OperationalError:
+        print("[!] DB tables missing — reinitializing...")
+        try:
+            init_db()
+            print("[✓] DB reinitialized successfully")
+        except Exception as e:
+            print(f"[✗] DB reinit failed: {e}")
+
+# ─── DB CONNECTION PER REQUEST ─────────────────────────────────────────────────
 def get_db():
     if "db" not in g:
         _ensure_tables()
@@ -310,7 +316,7 @@ def close_db(e=None):
     db = g.pop("db", None)
     if db: db.close()
 
-# ─── AUTH HELPERS ─────────────────────────────────────────────────────────────
+# ─── AUTH HELPERS ──────────────────────────────────────────────────────────────
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -337,6 +343,7 @@ def enforce_role_boundaries():
     path = request.path
     role = session.get("role", "")
 
+    # Public paths — always allowed
     if any(path == p or path.startswith(p + "/") for p in ["/static"]):
         return
     if path in ("/", "/login", "/logout", "/error"):
@@ -345,6 +352,7 @@ def enforce_role_boundaries():
         return
     if path == "/mentor/reset":
         return
+
     if not role:
         return
 
@@ -373,6 +381,30 @@ def enforce_role_boundaries():
                 msg=f"Access Denied — Company portal is for Red Team / employee accounts only. Your role: {role.upper()} — go to your team dashboard."), 403
 
 # ─── LOG ENGINE ───────────────────────────────────────────────────────────────
+_log_lock = threading.Lock()
+_init_lock = threading.Lock()
+_db_ready = False
+
+def _ensure_tables():
+    """Guaranteed one-time init. Thread-safe. Called before every DB operation."""
+    global _db_ready
+    if _db_ready:
+        return
+    with _init_lock:
+        if _db_ready:
+            return
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            conn.execute("SELECT 1 FROM users LIMIT 1")
+            conn.close()
+            _db_ready = True
+            print(f"[✓] _ensure_tables: DB already ready at {DB_PATH}")
+        except sqlite3.OperationalError:
+            print(f"[!] _ensure_tables: tables missing — calling init_db() now")
+            init_db()
+            _db_ready = True
+            print(f"[✓] _ensure_tables: init_db() done")
+
 def write_log(source, level, message, ip=None, username=None,
               stage=0, chain_id=None, incident_id=None, sigma_rule=None):
     _ensure_tables()
@@ -438,6 +470,7 @@ def log_attack_chain(stage_id, stage_name, attacker_ip, status="detected"):
 
 # ─── BACKGROUND LOG SIMULATOR ─────────────────────────────────────────────────
 def background_log_engine():
+    """Continuous background simulation of normal + attack traffic"""
     normal_msgs = {
         "access":   ["GET /index.html 200","GET /about 200","POST /api/data 200","GET /css/main.css 304","GET /js/app.js 200"],
         "auth":     ["Successful login: alice.chen from 192.168.1.101","Session created for bob.harris","Token refreshed for carol.james","Password policy check passed","2FA verified for grace.obi"],
@@ -490,6 +523,7 @@ def _gen_background_packets():
     except: pass
 
 def sigma_detection_engine():
+    """Run SIGMA rules against recent logs every 10 seconds"""
     while True:
         time.sleep(10)
         try:
@@ -610,7 +644,7 @@ def _gen_attack_packets(stage_id, attacker_ip):
         conn.close()
     except: pass
 
-# ─── ROUTES: COMPANY FRONTEND ─────────────────────────────────────────────────
+# ─── ROUTES: COMPANY FRONTEND ──────────────────────────────────────────────────
 @app.route("/")
 def index():
     write_log("access","INFO",f"GET / 200",ip=request.remote_addr)
@@ -708,7 +742,7 @@ def search():
         else:
             db = get_db()
             try:
-                rows = db.execute("SELECT username,email,department FROM users WHERE username LIKE ?",
+                rows = db.execute(f"SELECT username,email,department FROM users WHERE username LIKE ?",
                                   (f"%{q}%",)).fetchall()
                 results = [{"type":"user","data":f"{r['username']} | {r['email']} | {r['department']}"} for r in rows]
             except Exception as e:
@@ -849,8 +883,7 @@ def exfil():
         update_breach(pct_delta=8, stage=12, red_ip=ip)
     write_log("security","CRITICAL",f"DATA EXFILTRATION EXECUTED — {ip}",
               ip=ip,username=session.get("user"),stage=12)
-    return jsonify({"status":"exfiltrated","bytes":49283747,"destination":"45.33.32.156",
-                    "files":["financials_dump.csv","employees_pii.json","admin_credentials.txt"]})
+    return jsonify({"status":"exfiltrated","bytes":49283747,"destination":"45.33.32.156","files":["financials_dump.csv","employees_pii.json","admin_credentials.txt"]})
 
 # ─── SOC ROUTES ───────────────────────────────────────────────────────────────
 @app.route("/soc/monitor")
@@ -925,7 +958,8 @@ def api_ip_tags():
             (ip,tag,username,blocked,note,datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         )
         db.commit()
-        write_log("security","INFO",f"IP tagged: {ip} → {tag} (blocked={blocked}) by {session.get('user')}",ip=ip)
+        write_log("security","INFO",f"IP tagged: {ip} → {tag} (blocked={blocked}) by {session.get('user')}",
+                  ip=ip)
         return jsonify({"status":"ok"})
     rows = db.execute("SELECT * FROM ip_tags ORDER BY ts DESC").fetchall()
     return jsonify([dict(r) for r in rows])
@@ -1116,7 +1150,7 @@ def api_grc_submit():
     db.commit()
     return jsonify({"status":"ok","score":score,"control":control})
 
-# ─── WIN CONDITIONS & RESET ───────────────────────────────────────────────────
+# ─── WIN CONDITIONS & RESET ────────────────────────────────────────────────────
 @app.route("/api/win_conditions")
 def api_win_conditions():
     breach = get_breach()
@@ -1163,16 +1197,13 @@ def mentor_reset():
     conn.execute("UPDATE users SET active=1,sessions_revoked=0")
     conn.commit()
     conn.close()
-    global _db_ready
-    _db_ready = False
-    _ensure_tables()
     return jsonify({"status":"reset","message":"All competition data cleared. System ready."})
 
 @app.route("/error")
 def error_page():
     return render_template("error.html", msg="Page not found"), 404
 
-# ─── BACKGROUND THREADS — started once at module import ──────────────────────
+# ─── BACKGROUND THREADS (started once at import time) ─────────────────────────
 _bg_started = False
 def _start_background_threads():
     global _bg_started
