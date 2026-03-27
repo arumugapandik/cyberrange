@@ -10,6 +10,11 @@ from flask import (Flask, render_template, request, redirect, url_for,
                    session, jsonify, g, make_response)
 from functools import wraps
 
+app = Flask(__name__)
+# Fixed secret key — os.urandom(32) changes every restart and kills all sessions
+app.secret_key = os.environ.get("SECRET_KEY", "nullgrids-cyber-range-fixed-key-2024")
+DB_PATH = os.environ.get("DB_PATH", "nullgrids.db")
+
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 ATTACK_STAGES = [
     {"id":1,  "name":"Brute Force Login",        "weight":5,  "log_types":["auth","alerts","firewall"]},
@@ -114,9 +119,19 @@ FAKE_EMPLOYEES = [
 
 ATTACKER_IPS = ["45.33.32.156","198.51.100.42","203.0.113.77","185.220.101.33","91.108.4.18"]
 
-DB_PATH = os.environ.get("DB_PATH", "/tmp/nullgrids.db")
-
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH, timeout=10)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA journal_mode=WAL")
+    return g.db
+
+@app.teardown_appcontext
+def close_db(e=None):
+    db = g.pop("db", None)
+    if db: db.close()
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -271,51 +286,6 @@ def init_db():
     conn.close()
     print("[✓] Database initialized")
 
-
-# ─── FLASK APP ─────────────────────────────────────────────────────────────────
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
-
-# 🔥 RAILWAY FIX: init DB at module load time so Gunicorn picks it up
-print(f"[*] DB_PATH = {DB_PATH}")
-print("[*] Auto-initializing database...")
-try:
-    init_db()
-    print(f"[✓] init_db() SUCCESS — {DB_PATH}")
-except Exception as _e:
-    print(f"[✗] init_db() FAILED at module level: {_e}")
-
-
-# ─── DB HEALTH CHECK ──────────────────────────────────────────────────────────
-@app.before_request
-def ensure_db_ready():
-    """Self-healing: re-run init_db if tables are missing for any reason."""
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=5)
-        conn.execute("SELECT 1 FROM users LIMIT 1")
-        conn.close()
-    except sqlite3.OperationalError:
-        print("[!] DB tables missing — reinitializing...")
-        try:
-            init_db()
-            print("[✓] DB reinitialized successfully")
-        except Exception as e:
-            print(f"[✗] DB reinit failed: {e}")
-
-# ─── DB CONNECTION PER REQUEST ─────────────────────────────────────────────────
-def get_db():
-    if "db" not in g:
-        _ensure_tables()
-        g.db = sqlite3.connect(DB_PATH, timeout=10)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA journal_mode=WAL")
-    return g.db
-
-@app.teardown_appcontext
-def close_db(e=None):
-    db = g.pop("db", None)
-    if db: db.close()
-
 # ─── AUTH HELPERS ──────────────────────────────────────────────────────────────
 def login_required(f):
     @wraps(f)
@@ -344,36 +314,43 @@ def enforce_role_boundaries():
     role = session.get("role", "")
 
     # Public paths — always allowed
+    public = ["/", "/login", "/logout", "/error", "/static"]
     if any(path == p or path.startswith(p + "/") for p in ["/static"]):
         return
     if path in ("/", "/login", "/logout", "/error"):
         return
+    # Win conditions API is public (scoreboard)
     if path == "/api/win_conditions":
         return
+    # Mentor reset is key-protected, allow through
     if path == "/mentor/reset":
         return
 
     if not role:
-        return
+        return  # login_required decorators handle unauthenticated
 
+    # SOC-only paths
     soc_paths = ["/soc/", "/api/soc/"]
     if any(path.startswith(p) for p in soc_paths):
         if role not in ("soc", "admin"):
             return render_template("error.html",
                 msg=f"Access Denied — SOC area is restricted to SOC analysts. Your role: {role.upper()}"), 403
 
+    # DFIR-only paths
     dfir_paths = ["/dfir", "/api/dfir/"]
     if any(path == p or path.startswith(p) for p in dfir_paths):
         if role not in ("dfir", "admin"):
             return render_template("error.html",
                 msg=f"Access Denied — DFIR area is restricted to DFIR analysts. Your role: {role.upper()}"), 403
 
+    # GRC-only paths
     grc_paths = ["/grc/", "/api/grc/"]
     if any(path.startswith(p) for p in grc_paths):
         if role not in ("grc", "admin"):
             return render_template("error.html",
                 msg=f"Access Denied — GRC area is restricted to GRC managers. Your role: {role.upper()}"), 403
 
+    # Red Team / normal user paths — block SOC/DFIR/GRC from using attack vectors
     red_paths = ["/search", "/profile", "/upload", "/employee", "/admin", "/financials", "/exfil", "/dashboard"]
     if any(path == p or path.startswith(p) for p in red_paths):
         if role in ("soc", "dfir", "grc"):
@@ -382,32 +359,9 @@ def enforce_role_boundaries():
 
 # ─── LOG ENGINE ───────────────────────────────────────────────────────────────
 _log_lock = threading.Lock()
-_init_lock = threading.Lock()
-_db_ready = False
-
-def _ensure_tables():
-    """Guaranteed one-time init. Thread-safe. Called before every DB operation."""
-    global _db_ready
-    if _db_ready:
-        return
-    with _init_lock:
-        if _db_ready:
-            return
-        try:
-            conn = sqlite3.connect(DB_PATH, timeout=5)
-            conn.execute("SELECT 1 FROM users LIMIT 1")
-            conn.close()
-            _db_ready = True
-            print(f"[✓] _ensure_tables: DB already ready at {DB_PATH}")
-        except sqlite3.OperationalError:
-            print(f"[!] _ensure_tables: tables missing — calling init_db() now")
-            init_db()
-            _db_ready = True
-            print(f"[✓] _ensure_tables: init_db() done")
 
 def write_log(source, level, message, ip=None, username=None,
               stage=0, chain_id=None, incident_id=None, sigma_rule=None):
-    _ensure_tables()
     with _log_lock:
         try:
             conn = sqlite3.connect(DB_PATH, timeout=5)
@@ -424,7 +378,6 @@ def write_log(source, level, message, ip=None, username=None,
             print(f"[LOG ERROR] {e}")
 
 def get_breach():
-    _ensure_tables()
     conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT * FROM breach_state WHERE id=1").fetchone()
@@ -432,7 +385,6 @@ def get_breach():
     return dict(row) if row else {}
 
 def update_breach(pct_delta=0, stage=None, dfir=None, soc_esc=None, red_ip=None):
-    _ensure_tables()
     conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.execute("PRAGMA journal_mode=WAL")
     cur = conn.execute("SELECT * FROM breach_state WHERE id=1").fetchone()
@@ -453,7 +405,6 @@ def update_breach(pct_delta=0, stage=None, dfir=None, soc_esc=None, red_ip=None)
     conn.close()
 
 def log_attack_chain(stage_id, stage_name, attacker_ip, status="detected"):
-    _ensure_tables()
     breach = get_breach()
     chain_id = breach.get("chain_id", str(uuid.uuid4())[:8])
     incident_id = f"INC-{datetime.utcnow().strftime('%Y%m%d')}-{random.randint(1000,9999)}"
@@ -498,6 +449,7 @@ def background_log_engine():
             if random.random() < 0.08:
                 fp = random.choice(false_positives)
                 write_log(fp[0], fp[1], fp[2], ip=random.choice([e[3] for e in FAKE_EMPLOYEES]))
+            # Simulate packets
             _gen_background_packets()
             time.sleep(random.uniform(2,5))
         except Exception as e:
@@ -618,6 +570,7 @@ def simulate_attack_logs(stage_id, attacker_ip, username=None):
     for src, lvl, msg in logs:
         write_log(src, lvl, msg, ip=attacker_ip, username=username,
                   stage=stage_id, chain_id=chain_id, incident_id=incident_id)
+    # Simulate attack packets
     _gen_attack_packets(stage_id, attacker_ip)
     return incident_id, chain_id
 
@@ -655,6 +608,7 @@ def login():
     error = None
     ip = request.remote_addr
 
+    # If already logged in, redirect to correct dashboard
     if "user" in session:
         role = session.get("role", "")
         if role == "soc":  return redirect(url_for("soc_monitor"))
@@ -672,6 +626,7 @@ def login():
 
         if not user or user["password"] != pw_hash:
             write_log("auth","HIGH",f"FAILED login attempt from {ip} — user: {username}",ip=ip,username=username)
+            # Detect brute force
             conn2 = sqlite3.connect(DB_PATH, timeout=5)
             cutoff = (datetime.utcnow()-timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
             fails = conn2.execute("SELECT COUNT(*) FROM logs WHERE ip=? AND level='HIGH' AND source='auth' AND ts>?",
@@ -725,6 +680,7 @@ def search():
 
     if q:
         write_log("access","INFO",f"GET /search?q={q[:80]} 200",ip=ip,username=session.get("user"))
+        # Intentionally vulnerable SQLi simulation
         sqli_patterns = ["union","select","'","--","or 1","sleep(","xp_cmd","drop table"]
         is_sqli = any(p in q.lower() for p in sqli_patterns)
         if is_sqli:
@@ -732,6 +688,7 @@ def search():
             if breach.get("current_stage",0) < 3:
                 simulate_attack_logs(3, ip, session.get("user"))
                 update_breach(pct_delta=8, stage=3, red_ip=ip)
+            # Return fake "leaked" data
             results = [
                 {"type":"user","data":"jdoe | 5f4dcc3b5aa765d61d8327deb882cf99 | Finance"},
                 {"type":"user","data":"admin | 0192023a7bbd73250516f069df18b500 | IT"},
@@ -740,6 +697,7 @@ def search():
             write_log("security","CRITICAL",f"SQLi data extracted: credentials exposed — {ip}",
                       ip=ip,username=session.get("user"),stage=3)
         else:
+            # Normal search
             db = get_db()
             try:
                 rows = db.execute(f"SELECT username,email,department FROM users WHERE username LIKE ?",
@@ -758,12 +716,14 @@ def profile():
     if request.method == "POST":
         url = request.form.get("url","")
         write_log("webserver","HIGH",f"POST /profile url={url} — {ip}",ip=ip,username=session.get("user"))
+        # SSRF detection
         ssrf_indicators = ["169.254","192.168","10.","127.0","localhost","metadata","internal","file://"]
         if any(s in url.lower() for s in ssrf_indicators):
             breach = get_breach()
             if breach.get("current_stage",0) < 6:
                 simulate_attack_logs(6, ip, session.get("user"))
                 update_breach(pct_delta=8, stage=6, red_ip=ip)
+            # Fake internal response
             ssrf_result = {
                 "url": url,
                 "response": '{"instanceId":"i-0abc123def","region":"us-east-1","iam":{"role":"EC2-WebServer-Role"},"privateIp":"10.0.1.45","publicIp":"203.0.113.100"}'
@@ -826,8 +786,10 @@ def employee():
 
     if eid:
         write_log("access","MEDIUM",f"GET /employee?id={eid} — {ip}",ip=ip,username=session.get("user"))
+        # IDOR: any id works
         all_ids = [r["id"] for r in db.execute("SELECT id FROM employees").fetchall()]
         if eid not in all_ids:
+            # Sequential enumeration detected
             if breach.get("current_stage",0) < 5:
                 simulate_attack_logs(5, ip, session.get("user"))
                 update_breach(pct_delta=6, stage=5, red_ip=ip)
@@ -972,6 +934,30 @@ def api_escalate():
               username=session.get("user"))
     return jsonify({"status":"escalated","dfir_check": get_breach().get("dfir_unlocked",0)})
 
+@app.route("/api/soc/flag_ip", methods=["POST"])
+@role_required("soc","admin")
+def api_flag_ip():
+    """Quick-flag an IP from a log entry with a tag and note."""
+    data = request.json or {}
+    ip   = data.get("ip","")
+    tag  = data.get("tag", "suspicious")
+    note = data.get("note", "Flagged from log entry")
+    if not ip:
+        return jsonify({"error": "ip required"}), 400
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "INSERT OR REPLACE INTO ip_tags(ip,tag,username,blocked,note,ts) VALUES(?,?,?,0,?,?)",
+        (ip, tag, session.get("user","SOC"), note,
+         datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+    write_log("security","HIGH",
+              f"IP FLAGGED: {ip} tagged as [{tag}] by {session.get('user','SOC')} — {note}",
+              ip=ip, username=session.get("user"))
+    return jsonify({"status": "flagged", "ip": ip, "tag": tag})
+
 # ─── DFIR ROUTES ──────────────────────────────────────────────────────────────
 @app.route("/dfir")
 @role_required("dfir","admin")
@@ -988,6 +974,8 @@ def dfir_portal():
 def api_dfir_evidence():
     db = get_db()
     breach = get_breach()
+    stage = breach.get("current_stage",0)
+    # Evidence = attack-related logs
     logs = db.execute(
         "SELECT * FROM logs WHERE stage_triggered > 0 ORDER BY ts ASC LIMIT 500"
     ).fetchall()
@@ -1099,6 +1087,7 @@ def api_grc_controls():
 def api_grc_gap_analysis():
     breach = get_breach()
     stage = breach.get("current_stage",0)
+    # Map breach stage to failed controls
     gaps = []
     if stage >= 1:
         gaps.append({"control":"A.9.4","issue":"No account lockout after brute force","severity":"CRITICAL","nist":"AC-7"})
@@ -1160,6 +1149,7 @@ def api_win_conditions():
     grc_score = db.execute("SELECT SUM(score) FROM grc_submissions").fetchone()[0] or 0
     stage = breach.get("current_stage",0)
 
+    # Win conditions
     red_won = stage >= 12 and breach.get("breach_pct",0) >= 90
     blue_won = (breach.get("dfir_unlocked") and dfir_count >= 3
                 and breach.get("breach_pct",0) <= 40)
@@ -1203,20 +1193,16 @@ def mentor_reset():
 def error_page():
     return render_template("error.html", msg="Page not found"), 404
 
-# ─── BACKGROUND THREADS (started once at import time) ─────────────────────────
-_bg_started = False
-def _start_background_threads():
-    global _bg_started
-    if not _bg_started:
-        _bg_started = True
-        threading.Thread(target=background_log_engine, daemon=True).start()
-        threading.Thread(target=sigma_detection_engine, daemon=True).start()
-        print("[✓] Background threads started")
-
-_start_background_threads()
-
-# ─── LOCAL DEV ENTRY POINT ────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Always run init_db — it uses CREATE TABLE IF NOT EXISTS so it's safe to call every time
+    print("[*] Initializing database...")
+    init_db()
+
+    # Start background threads
+    bg = threading.Thread(target=background_log_engine, daemon=True)
+    bg.start()
+    sg = threading.Thread(target=sigma_detection_engine, daemon=True)
+    sg.start()
     print("""
 ╔═══════════════════════════════════════════════════════════╗
 ║     NullGrids Red vs Blue — Enterprise Cyber Range        ║
