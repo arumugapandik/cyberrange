@@ -301,10 +301,60 @@ def role_required(*roles):
             if "user" not in session:
                 return redirect(url_for("login"))
             if session.get("role") not in roles:
-                return render_template("error.html", msg="Access Denied — Insufficient Privileges"), 403
+                return render_template("error.html", msg=f"Access Denied — This area is restricted to: {', '.join(r.upper() for r in roles)}. Your role: {session.get('role','unknown').upper()}"), 403
             return f(*args, **kwargs)
         return decorated
     return decorator
+
+@app.before_request
+def enforce_role_boundaries():
+    """Hard gate: prevent any role from accessing another role's area via direct URL."""
+    path = request.path
+    role = session.get("role", "")
+
+    # Public paths — always allowed
+    public = ["/", "/login", "/logout", "/error", "/static"]
+    if any(path == p or path.startswith(p + "/") for p in ["/static"]):
+        return
+    if path in ("/", "/login", "/logout", "/error"):
+        return
+    # Win conditions API is public (scoreboard)
+    if path == "/api/win_conditions":
+        return
+    # Mentor reset is key-protected, allow through
+    if path == "/mentor/reset":
+        return
+
+    if not role:
+        return  # login_required decorators handle unauthenticated
+
+    # SOC-only paths
+    soc_paths = ["/soc/", "/api/soc/"]
+    if any(path.startswith(p) for p in soc_paths):
+        if role not in ("soc", "admin"):
+            return render_template("error.html",
+                msg=f"Access Denied — SOC area is restricted to SOC analysts. Your role: {role.upper()}"), 403
+
+    # DFIR-only paths
+    dfir_paths = ["/dfir", "/api/dfir/"]
+    if any(path == p or path.startswith(p) for p in dfir_paths):
+        if role not in ("dfir", "admin"):
+            return render_template("error.html",
+                msg=f"Access Denied — DFIR area is restricted to DFIR analysts. Your role: {role.upper()}"), 403
+
+    # GRC-only paths
+    grc_paths = ["/grc/", "/api/grc/"]
+    if any(path.startswith(p) for p in grc_paths):
+        if role not in ("grc", "admin"):
+            return render_template("error.html",
+                msg=f"Access Denied — GRC area is restricted to GRC managers. Your role: {role.upper()}"), 403
+
+    # Red Team / normal user paths — block SOC/DFIR/GRC from using attack vectors
+    red_paths = ["/search", "/profile", "/upload", "/employee", "/admin", "/financials", "/exfil", "/dashboard"]
+    if any(path == p or path.startswith(p) for p in red_paths):
+        if role in ("soc", "dfir", "grc"):
+            return render_template("error.html",
+                msg=f"Access Denied — Company portal is for Red Team / employee accounts only. Your role: {role.upper()} — go to your team dashboard."), 403
 
 # ─── LOG ENGINE ───────────────────────────────────────────────────────────────
 _log_lock = threading.Lock()
@@ -557,6 +607,14 @@ def login():
     error = None
     ip = request.remote_addr
 
+    # If already logged in, redirect to correct dashboard
+    if "user" in session:
+        role = session.get("role", "")
+        if role == "soc":  return redirect(url_for("soc_monitor"))
+        if role == "dfir": return redirect(url_for("dfir_portal"))
+        if role == "grc":  return redirect(url_for("grc_dashboard"))
+        return redirect(url_for("dashboard"))
+
     if request.method == "POST":
         username = request.form.get("username","").strip()
         password = request.form.get("password","")
@@ -755,12 +813,7 @@ def admin():
         if breach.get("current_stage",0) < 8:
             simulate_attack_logs(8, ip, session.get("user"))
             update_breach(pct_delta=9, stage=8, red_ip=ip)
-        # Privilege escalation path
-        if breach.get("current_stage",0) >= 7:
-            # Allow access after escalation
-            pass
-        else:
-            return render_template("error.html", msg="403 — Forbidden. Access logged."), 403
+        return render_template("error.html", msg="403 — Forbidden. Access logged."), 403
 
     write_log("access","INFO",f"Admin panel accessed — {ip}",ip=ip,username=session.get("user"),stage=8)
     users = db.execute("SELECT id,username,role,email,department,active FROM users").fetchall()
@@ -865,7 +918,7 @@ def api_ip_tags():
             "INSERT OR REPLACE INTO ip_tags(ip,tag,username,blocked,note,ts) VALUES(?,?,?,?,?,?)",
             (ip,tag,username,blocked,note,datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         )
-        db.connection.commit()
+        db.commit()
         write_log("security","INFO",f"IP tagged: {ip} → {tag} (blocked={blocked}) by {session.get('user')}",
                   ip=ip)
         return jsonify({"status":"ok"})
@@ -925,21 +978,21 @@ def api_dfir_action():
         db.execute("INSERT OR REPLACE INTO ip_tags(ip,tag,blocked,note,ts) VALUES(?,?,1,?,?)",
                    (target,"blocked",f"Blocked by DFIR: {session.get('user')}",
                     datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
-        db.connection.commit()
+        db.commit()
         write_log("security","CRITICAL",f"DFIR: IP {target} blocked by {session.get('user')}",ip=target)
         update_breach(pct_delta=-5)
         result = f"IP {target} blocked"
 
     elif action == "disable_account":
         db.execute("UPDATE users SET active=0 WHERE username=?",(target,))
-        db.connection.commit()
+        db.commit()
         write_log("auth","CRITICAL",f"DFIR: Account {target} disabled by {session.get('user')}")
         update_breach(pct_delta=-8)
         result = f"Account {target} disabled"
 
     elif action == "revoke_sessions":
         db.execute("UPDATE users SET sessions_revoked=1 WHERE username=?",(target,))
-        db.connection.commit()
+        db.commit()
         write_log("auth","HIGH",f"DFIR: All sessions revoked for {target}")
         update_breach(pct_delta=-5)
         result = f"Sessions revoked for {target}"
@@ -956,7 +1009,7 @@ def api_dfir_action():
 
     db.execute("INSERT INTO dfir_actions(action,target,performed_by,result) VALUES(?,?,?,?)",
                (action, target, session.get("user"), result))
-    db.connection.commit()
+    db.commit()
     return jsonify({"status":"ok","result":result,"breach":get_breach()})
 
 @app.route("/api/dfir/timeline")
@@ -1058,7 +1111,7 @@ def api_grc_submit():
         elif status == "planned": score = ctrl["weight"] * 0.2
     db.execute("INSERT INTO grc_submissions(team,control,status,evidence,score) VALUES(?,?,?,?,?)",
                (session.get("user"), control, status, evidence, score))
-    db.connection.commit()
+    db.commit()
     return jsonify({"status":"ok","score":score,"control":control})
 
 # ─── WIN CONDITIONS & RESET ────────────────────────────────────────────────────
@@ -1116,18 +1169,9 @@ def error_page():
     return render_template("error.html", msg="Page not found"), 404
 
 if __name__ == "__main__":
-    if not os.path.exists(DB_PATH):
-        print("[*] Initializing database...")
-        init_db()
-    else:
-        # Re-seed if needed
-        conn = sqlite3.connect(DB_PATH)
-        cnt = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        conn.close()
-        if cnt == 0:
-            init_db()
-        else:
-            print("[✓] Database exists")
+    # Always run init_db — it uses CREATE TABLE IF NOT EXISTS so it's safe to call every time
+    print("[*] Initializing database...")
+    init_db()
 
     # Start background threads
     bg = threading.Thread(target=background_log_engine, daemon=True)

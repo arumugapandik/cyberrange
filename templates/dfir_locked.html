@@ -10,6 +10,6 @@
     Current Breach: <strong style="color:#ff3366">{{ breach.breach_pct|round(1) }}%</strong> | 
     SOC Escalated: <strong style="color:#{{ 'ff3366' if not breach.soc_escalated else '00ff88' }}">{{ 'NO' if not breach.soc_escalated else 'YES' }}</strong>
   </p>
-  <a href="/soc/monitor" style="background:#ff8800;color:#000;padding:12px 24px;border-radius:8px;font-weight:700;text-decoration:none">Go to SOC Monitor →</a>
+  <a href="/dfir" style="background:#ff8800;color:#000;padding:12px 24px;border-radius:8px;font-weight:700;text-decoration:none">Check Status →</a>
 </div>
 {% endblock %}
