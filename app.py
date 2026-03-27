@@ -305,15 +305,7 @@ def ensure_db_ready():
 # ─── DB CONNECTION PER REQUEST ─────────────────────────────────────────────────
 def get_db():
     if "db" not in g:
-        # Guarantee tables exist before handing connection to any route
-        try:
-            _check = sqlite3.connect(DB_PATH, timeout=5)
-            _check.execute("SELECT 1 FROM users LIMIT 1")
-            _check.close()
-        except sqlite3.OperationalError:
-            print(f"[!] get_db: tables missing in {DB_PATH} — running init_db()")
-            init_db()
-            print("[✓] get_db: init_db() completed")
+        _ensure_tables()
         g.db = sqlite3.connect(DB_PATH, timeout=10)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA journal_mode=WAL")
@@ -390,9 +382,32 @@ def enforce_role_boundaries():
 
 # ─── LOG ENGINE ───────────────────────────────────────────────────────────────
 _log_lock = threading.Lock()
+_init_lock = threading.Lock()
+_db_ready = False
+
+def _ensure_tables():
+    """Guaranteed one-time init. Thread-safe. Called before every DB operation."""
+    global _db_ready
+    if _db_ready:
+        return
+    with _init_lock:
+        if _db_ready:
+            return
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            conn.execute("SELECT 1 FROM users LIMIT 1")
+            conn.close()
+            _db_ready = True
+            print(f"[✓] _ensure_tables: DB already ready at {DB_PATH}")
+        except sqlite3.OperationalError:
+            print(f"[!] _ensure_tables: tables missing — calling init_db() now")
+            init_db()
+            _db_ready = True
+            print(f"[✓] _ensure_tables: init_db() done")
 
 def write_log(source, level, message, ip=None, username=None,
               stage=0, chain_id=None, incident_id=None, sigma_rule=None):
+    _ensure_tables()
     with _log_lock:
         try:
             conn = sqlite3.connect(DB_PATH, timeout=5)
@@ -409,6 +424,7 @@ def write_log(source, level, message, ip=None, username=None,
             print(f"[LOG ERROR] {e}")
 
 def get_breach():
+    _ensure_tables()
     conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT * FROM breach_state WHERE id=1").fetchone()
@@ -416,6 +432,7 @@ def get_breach():
     return dict(row) if row else {}
 
 def update_breach(pct_delta=0, stage=None, dfir=None, soc_esc=None, red_ip=None):
+    _ensure_tables()
     conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.execute("PRAGMA journal_mode=WAL")
     cur = conn.execute("SELECT * FROM breach_state WHERE id=1").fetchone()
@@ -436,6 +453,7 @@ def update_breach(pct_delta=0, stage=None, dfir=None, soc_esc=None, red_ip=None)
     conn.close()
 
 def log_attack_chain(stage_id, stage_name, attacker_ip, status="detected"):
+    _ensure_tables()
     breach = get_breach()
     chain_id = breach.get("chain_id", str(uuid.uuid4())[:8])
     incident_id = f"INC-{datetime.utcnow().strftime('%Y%m%d')}-{random.randint(1000,9999)}"
