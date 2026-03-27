@@ -277,8 +277,13 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
 
 # 🔥 RAILWAY FIX: init DB at module load time so Gunicorn picks it up
+print(f"[*] DB_PATH = {DB_PATH}")
 print("[*] Auto-initializing database...")
-init_db()
+try:
+    init_db()
+    print(f"[✓] init_db() SUCCESS — {DB_PATH}")
+except Exception as _e:
+    print(f"[✗] init_db() FAILED at module level: {_e}")
 
 
 # ─── DB HEALTH CHECK ──────────────────────────────────────────────────────────
@@ -300,6 +305,15 @@ def ensure_db_ready():
 # ─── DB CONNECTION PER REQUEST ─────────────────────────────────────────────────
 def get_db():
     if "db" not in g:
+        # Guarantee tables exist before handing connection to any route
+        try:
+            _check = sqlite3.connect(DB_PATH, timeout=5)
+            _check.execute("SELECT 1 FROM users LIMIT 1")
+            _check.close()
+        except sqlite3.OperationalError:
+            print(f"[!] get_db: tables missing in {DB_PATH} — running init_db()")
+            init_db()
+            print("[✓] get_db: init_db() completed")
         g.db = sqlite3.connect(DB_PATH, timeout=10)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA journal_mode=WAL")
