@@ -114,7 +114,7 @@ FAKE_EMPLOYEES = [
 
 ATTACKER_IPS = ["45.33.32.156","198.51.100.42","203.0.113.77","185.220.101.33","91.108.4.18"]
 
-DB_PATH = os.environ.get("DB_PATH", "nullgrids.db")
+DB_PATH = os.environ.get("DB_PATH", "/tmp/nullgrids.db")
 
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
 def init_db():
@@ -280,6 +280,22 @@ app.secret_key = os.environ.get("SECRET_KEY", os.urandom(32))
 print("[*] Auto-initializing database...")
 init_db()
 
+
+# ─── DB HEALTH CHECK ──────────────────────────────────────────────────────────
+@app.before_request
+def ensure_db_ready():
+    """Self-healing: re-run init_db if tables are missing for any reason."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        conn.execute("SELECT 1 FROM users LIMIT 1")
+        conn.close()
+    except sqlite3.OperationalError:
+        print("[!] DB tables missing — reinitializing...")
+        try:
+            init_db()
+            print("[✓] DB reinitialized successfully")
+        except Exception as e:
+            print(f"[✗] DB reinit failed: {e}")
 
 # ─── DB CONNECTION PER REQUEST ─────────────────────────────────────────────────
 def get_db():
